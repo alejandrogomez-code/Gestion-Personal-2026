@@ -51,6 +51,26 @@ async function callLLM(system, user, maxTokens = 400) {
     .trim();
 }
 
+// Igual que callLLM pero acepta una conversación (varios turnos).
+async function callLLMMessages(system, messages, maxTokens = 500) {
+  // Anthropic exige que el primer mensaje sea de rol "user".
+  let msgs = (messages || [])
+    .map((m) => ({ role: m.role === "user" ? "user" : "assistant", content: String(m.content || "") }))
+    .filter((m) => m.content.trim() !== "");
+  if (msgs.length && msgs[0].role !== "user") {
+    msgs.unshift({ role: "user", content: "Quiero analizar mi plan de peso." });
+  }
+  if (!msgs.length) msgs = [{ role: "user", content: "Analizá mi plan de peso." }];
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({ model: AI_MODEL, max_tokens: maxTokens, system, messages: msgs }),
+  });
+  if (!res.ok) throw new Error("Upstream AI error " + res.status);
+  const data = await res.json();
+  return (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+}
+
 const firstInt = (txt) => parseInt((String(txt).match(/\d+/) || ["0"])[0], 10);
 
 export async function POST(req) {
@@ -84,16 +104,23 @@ export async function POST(req) {
         return NextResponse.json({ ok: true, value: firstInt(txt) });
       }
 
-      // ---- Opinión del plan de peso (devuelve texto) -------------------
-      case "weight_opinion": {
-        const txt = await callLLM(
-          "Sos un asistente de salud prudente. Das orientación general, breve y empática (máximo 4 oraciones). " +
-            "SIEMPRE aclarás que no reemplaza asesoramiento médico ni nutricional.",
-          `Peso actual: ${payload.current} kg. Objetivo: ${payload.target} kg. ` +
-            `Plazo: ${payload.deadline || "no definido"}. Mediciones registradas: ${payload.count}. ` +
-            `Comentá si el ritmo es razonable y qué tener en cuenta.`,
-          400
-        );
+      // ---- Plan de peso: conversación (devuelve texto) ----------------
+      // Recibe el plazo y el ritmo YA calculados, para no hacer cuentas de fechas.
+      case "weight_chat": {
+        const p = payload.plan || {};
+        const system =
+          "Sos un asistente de salud prudente y empático que conversa en español. " +
+          "Usá EXACTAMENTE estos datos ya calculados, no recalcules fechas ni plazos:\n" +
+          `- Fecha de hoy: ${p.today}\n` +
+          `- Peso actual: ${p.current} kg\n` +
+          `- Peso objetivo: ${p.target} kg\n` +
+          `- Falta bajar: ${p.toLose} kg\n` +
+          `- Semanas hasta el plazo: ${p.weeksLeft}\n` +
+          `- Ritmo necesario: ${p.rateWeek} kg por semana\n` +
+          `- Mediciones registradas: ${p.count}\n` +
+          "Respondé claro y breve (máximo 5 oraciones). NO uses markdown, asteriscos ni viñetas: solo texto plano. " +
+          "SIEMPRE aclarás que es orientación general y no reemplaza asesoramiento médico ni nutricional.";
+        const txt = await callLLMMessages(system, payload.messages, 500);
         return NextResponse.json({ ok: true, text: txt });
       }
 
@@ -101,7 +128,8 @@ export async function POST(req) {
       case "wellbeing_insights": {
         const txt = await callLLM(
           "Sos un coach de bienestar. Analizás registros de ánimo, energía y estrés y sugerís patrones y " +
-            "recomendaciones concretas y breves (máximo 5 oraciones). No diagnosticás.",
+            "recomendaciones concretas y breves (máximo 5 oraciones). No diagnosticás. " +
+            "NO uses markdown ni asteriscos: solo texto plano.",
           `Entradas del diario (ánimo/energía/estrés 1-10): ${JSON.stringify(payload.journal)}. ` +
             `Registros de actividad física: ${payload.activityCount}. Registros de comidas: ${payload.mealCount}. ` +
             `Relacioná el estado de ánimo con la actividad y la alimentación cuando sea posible.`,
