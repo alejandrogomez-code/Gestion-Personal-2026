@@ -170,6 +170,7 @@ const FIELD_SCHEMAS = {
     { key: "name", label: "Nombre", type: "text", required: true },
     { key: "kind", label: "Ámbito", type: "select", options: ["economia", "general"] },
     { key: "color", label: "Color", type: "color" },
+    { key: "monthly_budget", label: "Presupuesto mensual (opcional)", type: "number" },
   ],
   meals: [
     { key: "date", label: "Fecha", type: "date", required: true },
@@ -254,6 +255,71 @@ function progressColor(pct) {
   if (pct < 40) return "var(--danger)";
   if (pct < 75) return "var(--warning)";
   return "var(--success)";
+}
+
+/* --------- Parseo de CSV para importar movimientos ---------------------- */
+// Normaliza importes en formato AR ("1.234,56") o US ("1,234.56").
+function parseAmount(str) {
+  if (str == null) return 0;
+  let s = String(str).replace(/[^\d.,\-]/g, "");
+  if (s.includes(".") && s.includes(",")) {
+    if (s.lastIndexOf(",") > s.lastIndexOf(".")) s = s.replace(/\./g, "").replace(",", ".");
+    else s = s.replace(/,/g, "");
+  } else if (s.includes(",")) {
+    s = s.replace(/\./g, "").replace(",", ".");
+  }
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+// Convierte fechas dd/mm/aaaa o aaaa-mm-dd a ISO (aaaa-mm-dd).
+function parseAnyDate(str) {
+  if (!str) return todayISO();
+  const s = String(str).trim();
+  let m = s.match(/^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})/);
+  if (m) { let [, d, mo, y] = m; if (y.length === 2) y = "20" + y; return `${y}-${mo.padStart(2, "0")}-${d.padStart(2, "0")}`; }
+  m = s.match(/^(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})/);
+  if (m) { const [, y, mo, d] = m; return `${y}-${mo.padStart(2, "0")}-${d.padStart(2, "0")}`; }
+  return s.slice(0, 10);
+}
+// Parser CSV simple con autodetección de separador (, o ;) y comillas.
+function parseCSV(text) {
+  const firstLine = text.replace(/\r/g, "").split("\n")[0] || "";
+  const delim = (firstLine.match(/;/g) || []).length > (firstLine.match(/,/g) || []).length ? ";" : ",";
+  const lines = text.replace(/\r/g, "").split("\n").filter((l) => l.trim() !== "");
+  const parseLine = (line) => {
+    const out = []; let cur = ""; let inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { if (inQ && line[i + 1] === '"') { cur += '"'; i++; } else inQ = !inQ; }
+      else if (ch === delim && !inQ) { out.push(cur); cur = ""; }
+      else cur += ch;
+    }
+    out.push(cur);
+    return out.map((s) => s.trim());
+  };
+  const headers = (lines[0] ? parseLine(lines[0]) : []).map((h) => h.toLowerCase());
+  const rows = lines.slice(1).map(parseLine);
+  return { headers, rows };
+}
+// Mapea filas de CSV a movimientos {date, description, amount, movement_type}.
+function csvRowsToMovements({ headers, rows }) {
+  const find = (keys) => headers.findIndex((h) => keys.some((k) => h.includes(k)));
+  const dateCol = find(["fecha", "date"]);
+  const descCol = find(["desc", "detalle", "concepto", "movimiento", "referencia", "glosa"]);
+  const amountCol = find(["importe", "monto", "amount", "valor"]);
+  const debitCol = find(["debito", "débito", "debit"]);
+  const creditCol = find(["credito", "crédito", "credit"]);
+  return rows.map((r) => {
+    let amount = 0, type = "egreso";
+    if (amountCol >= 0) { const v = parseAmount(r[amountCol]); type = v < 0 ? "egreso" : "ingreso"; amount = Math.abs(v); }
+    else { const d = debitCol >= 0 ? parseAmount(r[debitCol]) : 0; const c = creditCol >= 0 ? parseAmount(r[creditCol]) : 0;
+      if (d) { type = "egreso"; amount = Math.abs(d); } else { type = "ingreso"; amount = Math.abs(c); } }
+    return {
+      date: dateCol >= 0 ? parseAnyDate(r[dateCol]) : todayISO(),
+      description: descCol >= 0 ? r[descCol] : "(sin descripción)",
+      amount, movement_type: type,
+    };
+  }).filter((m) => m.amount > 0);
 }
 
 /* ----------------------------------------------------------------------------
@@ -931,22 +997,38 @@ function EconSituacion({ accounts, currency }) {
 
 function EconMovimientos({ movements, accounts, categories, currency }) {
   const modal = useFormModal();
+  const [transferOpen, setTransferOpen] = useState(false);
+  const [csvOpen, setCsvOpen] = useState(false);
   const catName = (id) => categories.rows.find((c) => c.id === id)?.name || "—";
   const accName = (id) => accounts.rows.find((a) => a.id === id)?.name || "—";
 
   const save = async (form) => {
-    // Los movimientos nuevos entran como "pendiente de confirmar" salvo que se indique otro estado.
     const payload = { ...form, status: form.status || "pendiente de confirmar" };
     if (modal.editing) await movements.update(modal.editing.id, payload);
     else await movements.create(payload);
     modal.close();
   };
 
-  // Importación futura desde API bancaria (placeholder).
-  const importFromBank = async () => {
-    const incoming = await bankFetchMovements();
-    if (!incoming.length) { alert("Integración bancaria aún no conectada (placeholder)."); return; }
-    for (const m of incoming) await movements.create({ ...m, status: "pendiente de confirmar" });
+  // Transferencia: crea un movimiento tipo "transferencia", ajusta los saldos de
+  // ambas cuentas y NO cuenta como ingreso ni egreso en los informes.
+  const doTransfer = async ({ from, to, amount, date, description }) => {
+    const amt = num(amount);
+    await movements.create({
+      date, account_id: from, transfer_account_id: to, amount: amt,
+      movement_type: "transferencia", description: description || "Transferencia", status: "confirmado",
+    });
+    const fromAcc = accounts.rows.find((a) => a.id === from);
+    const toAcc = accounts.rows.find((a) => a.id === to);
+    if (fromAcc) await accounts.update(from, { balance: num(fromAcc.balance) - amt });
+    if (toAcc) await accounts.update(to, { balance: num(toAcc.balance) + amt });
+    setTransferOpen(false);
+  };
+
+  // Importación de CSV: cada fila entra como movimiento "pendiente de confirmar".
+  const doImportCsv = async ({ account_id, rows }) => {
+    for (const m of rows) await movements.create({ ...m, account_id, status: "pendiente de confirmar" });
+    setCsvOpen(false);
+    alert(`Se importaron ${rows.length} movimientos como pendientes de confirmar.`);
   };
 
   const pending = movements.rows.filter((m) => m.status === "pendiente de confirmar");
@@ -955,18 +1037,23 @@ function EconMovimientos({ movements, accounts, categories, currency }) {
   const columns = [
     { key: "date", label: "Fecha" },
     { key: "description", label: "Descripción" },
-    { key: "account_id", label: "Cuenta", render: (m) => accName(m.account_id) },
-    { key: "category_id", label: "Categoría", render: (m) => catName(m.category_id) },
-    { key: "amount", label: "Importe", render: (m) => (
-      <span style={{ color: m.movement_type === "ingreso" ? "var(--success)" : "var(--danger)" }}>
-        {m.movement_type === "ingreso" ? "+" : "-"}{fmtMoney(m.amount, currency)}
-      </span>) },
+    { key: "account_id", label: "Cuenta", render: (m) => m.movement_type === "transferencia"
+      ? `${accName(m.account_id)} → ${accName(m.transfer_account_id)}` : accName(m.account_id) },
+    { key: "category_id", label: "Categoría", render: (m) => m.movement_type === "transferencia" ? "Transferencia" : catName(m.category_id) },
+    { key: "amount", label: "Importe", render: (m) => {
+      const color = m.movement_type === "ingreso" ? "var(--success)" : m.movement_type === "egreso" ? "var(--danger)" : "var(--muted)";
+      const sign = m.movement_type === "ingreso" ? "+" : m.movement_type === "egreso" ? "-" : "";
+      return <span style={{ color }}>{sign}{fmtMoney(m.amount, currency)}</span>;
+    } },
   ];
 
   return (
     <div>
       <SectionHeader title="Movimientos" onAdd={modal.add} addLabel="Nuevo movimiento"
-        right={<Button size="sm" variant="ghost" onClick={importFromBank}>Importar banco</Button>} />
+        right={<>
+          <Button size="sm" variant="ghost" onClick={() => setTransferOpen(true)}>Transferencia</Button>
+          <Button size="sm" variant="ghost" onClick={() => setCsvOpen(true)}>Importar CSV</Button>
+        </>} />
 
       <h3 className="gp-subtitle">Pendientes de confirmar</h3>
       {pending.length === 0 ? <div className="gp-empty-box">No hay movimientos pendientes.</div> : (
@@ -998,7 +1085,107 @@ function EconMovimientos({ movements, accounts, categories, currency }) {
         <EntityForm schema={FIELD_SCHEMAS.financial_movements} initial={modal.editing}
           refs={{ accounts: accounts.rows, categories: categories.rows }} onSubmit={save} onCancel={modal.close} />
       </Modal>
+
+      {transferOpen && <TransferModal accounts={accounts.rows} currency={currency}
+        onClose={() => setTransferOpen(false)} onSubmit={doTransfer} />}
+      {csvOpen && <CsvImportModal accounts={accounts.rows}
+        onClose={() => setCsvOpen(false)} onImport={doImportCsv} />}
     </div>
+  );
+}
+
+/* Modal de transferencia entre cuentas. */
+function TransferModal({ accounts, currency, onClose, onSubmit }) {
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [amount, setAmount] = useState("");
+  const [date, setDate] = useState(todayISO());
+  const [description, setDescription] = useState("");
+  const submit = () => {
+    if (!from || !to) { alert("Elegí cuenta origen y destino."); return; }
+    if (from === to) { alert("La cuenta origen y destino no pueden ser la misma."); return; }
+    if (num(amount) <= 0) { alert("Ingresá un importe válido."); return; }
+    onSubmit({ from, to, amount, date, description });
+  };
+  return (
+    <Modal open title="Transferencia entre cuentas" onClose={onClose}>
+      <div className="gp-form">
+        <div className="gp-field"><label>Cuenta origen<span className="gp-req">*</span></label>
+          <select value={from} onChange={(e) => setFrom(e.target.value)}>
+            <option value="">— Seleccionar —</option>
+            {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+          </select></div>
+        <div className="gp-field"><label>Cuenta destino<span className="gp-req">*</span></label>
+          <select value={to} onChange={(e) => setTo(e.target.value)}>
+            <option value="">— Seleccionar —</option>
+            {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+          </select></div>
+        <div className="gp-field"><label>Importe<span className="gp-req">*</span></label>
+          <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} /></div>
+        <div className="gp-field"><label>Fecha</label>
+          <input type="date" value={date} onChange={(e) => setDate(e.target.value)} /></div>
+        <div className="gp-field"><label>Descripción (opcional)</label>
+          <input value={description} onChange={(e) => setDescription(e.target.value)} /></div>
+        <p className="gp-hint"><Sparkles size={13} /> Ajusta el saldo de ambas cuentas y no cuenta como gasto ni ingreso.</p>
+        <div className="gp-form-actions">
+          <Button variant="ghost" onClick={onClose}>Cancelar</Button>
+          <Button onClick={submit}><Check size={16} /> Transferir</Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/* Modal de importación de movimientos desde un archivo CSV. */
+function CsvImportModal({ accounts, onClose, onImport }) {
+  const [accountId, setAccountId] = useState("");
+  const [parsed, setParsed] = useState(null);
+  const onFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const rows = csvRowsToMovements(parseCSV(text));
+      setParsed(rows);
+    } catch { alert("No se pudo leer el CSV."); }
+  };
+  const submit = () => {
+    if (!accountId) { alert("Elegí la cuenta a la que importar."); return; }
+    if (!parsed || !parsed.length) { alert("Cargá un CSV con movimientos válidos."); return; }
+    onImport({ account_id: accountId, rows: parsed });
+  };
+  return (
+    <Modal open title="Importar movimientos desde CSV" onClose={onClose}>
+      <div className="gp-form">
+        <div className="gp-field"><label>Cuenta destino<span className="gp-req">*</span></label>
+          <select value={accountId} onChange={(e) => setAccountId(e.target.value)}>
+            <option value="">— Seleccionar —</option>
+            {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+          </select></div>
+        <div className="gp-field"><label>Archivo CSV</label>
+          <input type="file" accept=".csv,text/csv" onChange={onFile} /></div>
+        <p className="gp-hint"><Sparkles size={13} /> Detecto solo las columnas de fecha, descripción e importe (o débito/crédito). Entran como pendientes para que las revises.</p>
+        {parsed && (
+          <div>
+            <p className="gp-muted">Se detectaron <b>{parsed.length}</b> movimientos. Vista previa:</p>
+            <div className="gp-table-wrap">
+              <table className="gp-table">
+                <thead><tr><th>Fecha</th><th>Descripción</th><th>Tipo</th><th>Importe</th></tr></thead>
+                <tbody>
+                  {parsed.slice(0, 5).map((m, i) => (
+                    <tr key={i}><td>{m.date}</td><td>{m.description}</td><td>{m.movement_type}</td><td>{fmtMoney(m.amount)}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+        <div className="gp-form-actions">
+          <Button variant="ghost" onClick={onClose}>Cancelar</Button>
+          <Button onClick={submit}><Check size={16} /> Importar</Button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
@@ -1030,11 +1217,46 @@ function EconInformes({ movements, categories, currency }) {
 
   const total = inMonth.reduce((s, m) => s + num(m.amount), 0);
 
+  // Presupuestos: para cada categoría con tope definido, cuánto se gastó este mes.
+  const spentByCat = (id) => inMonth.filter((m) => m.category_id === id).reduce((s, m) => s + num(m.amount), 0);
+  const budgets = categories.rows
+    .filter((c) => num(c.monthly_budget) > 0)
+    .map((c) => {
+      const spent = spentByCat(c.id);
+      const budget = num(c.monthly_budget);
+      return { id: c.id, name: c.name, color: c.color || "var(--primary)", spent, budget, pct: (spent / budget) * 100 };
+    })
+    .sort((a, b) => b.pct - a.pct);
+  const budgetColor = (pct) => (pct >= 100 ? "var(--danger)" : pct >= 80 ? "var(--warning)" : "var(--success)");
+
   return (
     <div>
       <SectionHeader title="Informes mensuales"
         right={<input type="month" value={month} onChange={(e) => setMonth(e.target.value)} />} />
       <StatCard label={`Total gastos ${month}`} value={fmtMoney(total, currency)} color="var(--danger)" />
+
+      {budgets.length > 0 && (
+        <Card>
+          <h4 className="gp-chart-title">Presupuestos del mes</h4>
+          {budgets.map((b) => (
+            <div key={b.id} className="gp-budget">
+              <div className="gp-budget-top">
+                <span>{b.name}</span>
+                <span style={{ color: budgetColor(b.pct), fontWeight: 600 }}>
+                  {fmtMoney(b.spent, currency)} / {fmtMoney(b.budget, currency)}
+                  {b.pct >= 100 && " · ¡excedido!"}
+                </span>
+              </div>
+              <div className="gp-progress">
+                <div className="gp-progress-bar"
+                  style={{ width: `${Math.min(100, b.pct)}%`, background: budgetColor(b.pct) }} />
+              </div>
+              <span className="gp-muted">{Math.round(b.pct)}% usado</span>
+            </div>
+          ))}
+        </Card>
+      )}
+
       <Card>
         <BarChart data={byCat.map((c) => ({ label: c.name.slice(0, 8), value: Math.round(c.value), color: c.color }))} />
       </Card>
@@ -1918,6 +2140,9 @@ h1,h2,h3,h4 { font-family:'Sora','Inter',sans-serif; margin: 0; }
 .gp-book-info { flex:1; }
 .gp-progress { height:7px; background:var(--surface-2); border-radius:10px; margin:6px 0 4px; overflow:hidden; }
 .gp-progress-bar { height:100%; background:var(--success); border-radius:10px; }
+.gp-budget { margin-bottom:14px; }
+.gp-budget:last-child { margin-bottom:0; }
+.gp-budget-top { display:flex; justify-content:space-between; align-items:center; font-size:13px; gap:8px; }
 
 /* Diario */
 .gp-journal { display:flex; flex-direction:column; gap:8px; }
