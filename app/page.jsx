@@ -1425,8 +1425,13 @@ function AuthScreen() {
 
   const submit = async () => {
     setBusy(true); setMsg("");
-    const fn = mode === "login" ? supabase.auth.signInWithPassword : supabase.auth.signUp;
-    const { error } = await fn({ email, password });
+    // Llamar los métodos directamente sobre supabase.auth: si se extraen a una
+    // variable pierden el binding de `this` y fallan con
+    // "Cannot read properties of undefined (reading 'fetch')".
+    const { error } =
+      mode === "login"
+        ? await supabase.auth.signInWithPassword({ email, password })
+        : await supabase.auth.signUp({ email, password });
     if (error) setMsg(error.message);
     else if (mode === "signup") setMsg("Revisá tu email para confirmar la cuenta.");
     setBusy(false);
