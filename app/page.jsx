@@ -23,7 +23,7 @@ import Chart from "chart.js/auto";
 import {
   Target, Wallet, HeartPulse, Trophy, NotebookPen, Settings as SettingsIcon,
   Plus, X, Pencil, Trash2, Check, ChevronLeft, Sun, Moon, LogOut, Sparkles,
-  TrendingUp, TrendingDown, Calendar, BookOpen, Activity, Utensils, Scale,
+  TrendingUp, TrendingDown, Calendar, BookOpen, Activity, Utensils, Scale, Bell,
 } from "lucide-react";
 
 /* ----------------------------------------------------------------------------
@@ -121,6 +121,7 @@ const MODULES = [
   { id: "habitos", label: "Buenos Hábitos", icon: HeartPulse, color: "#2f9e44", desc: "Comida, actividad, peso y lectura" },
   { id: "tenis", label: "Tenis", icon: Trophy, color: "#f08c00", desc: "Partidos y rendimiento" },
   { id: "diario", label: "Diario Personal", icon: NotebookPen, color: "#e8590c", desc: "Ánimo, energía y reflexión diaria" },
+  { id: "recordatorios", label: "Recordatorios", icon: Bell, color: "#0ca678", desc: "Acciones con vencimiento y aviso por WhatsApp" },
   { id: "config", label: "Configuración", icon: SettingsIcon, color: "#5b6b80", desc: "Perfil, categorías y temas" },
 ];
 
@@ -225,6 +226,13 @@ const FIELD_SCHEMAS = {
     { key: "note", label: "Nota libre del día", type: "textarea" },
     { key: "achievements", label: "Principales logros del día", type: "textarea" },
     { key: "improve_tomorrow", label: "Qué mejorar mañana", type: "textarea" },
+  ],
+  reminders: [
+    { key: "title", label: "Acción / recordatorio", type: "text", required: true },
+    { key: "description", label: "Descripción", type: "textarea" },
+    { key: "due_date", label: "Fecha de vencimiento", type: "date", required: true },
+    { key: "status", label: "Estado", type: "select", options: ["pendiente", "completado"] },
+    { key: "notes", label: "Observación", type: "text" },
   ],
 };
 
@@ -1786,7 +1794,67 @@ function DiarioModule({ userId }) {
 }
 
 /* ============================================================================
- *  MÓDULO 6 — CONFIGURACIÓN
+ *  MÓDULO 6 — RECORDATORIOS
+ * ==========================================================================*/
+function RecordatoriosModule({ userId }) {
+  const reminders = useTable("reminders", userId);
+  const modal = useFormModal();
+  const today = todayISO();
+
+  const save = async (form) => {
+    const payload = { ...form, status: form.status || "pendiente" };
+    if (modal.editing) await reminders.update(modal.editing.id, payload);
+    else await reminders.create(payload);
+    modal.close();
+  };
+
+  const sorted = [...reminders.rows].sort((a, b) => (a.due_date > b.due_date ? 1 : -1));
+  const pendientes = sorted.filter((r) => r.status === "pendiente");
+  const vencidos = pendientes.filter((r) => r.due_date && r.due_date < today);
+  const completados = sorted.filter((r) => r.status === "completado");
+  const daysLeft = (d) => Math.round((new Date(d + "T00:00:00") - new Date(today + "T00:00:00")) / 86400000);
+
+  return (
+    <div>
+      <SectionHeader title="Recordatorios" onAdd={modal.add} addLabel="Nuevo recordatorio" />
+      <div className="gp-grid gp-grid-3">
+        <StatCard label="Pendientes" value={pendientes.length} color="var(--primary)" />
+        <StatCard label="Vencidos" value={vencidos.length} color="var(--danger)" />
+        <StatCard label="Completados" value={completados.length} color="var(--success)" />
+      </div>
+      <CompactList items={sorted}
+        columns={[
+          { key: "done", label: "", render: (r) => (
+            <button className={`gp-check ${r.status === "completado" ? "on" : ""}`}
+              title={r.status === "completado" ? "Marcar pendiente" : "Marcar completado"}
+              onClick={() => reminders.update(r.id, { status: r.status === "completado" ? "pendiente" : "completado" })}>
+              {r.status === "completado" && <Check size={14} />}
+            </button>) },
+          { key: "title", label: "Acción", render: (r) => (
+            <span style={{ textDecoration: r.status === "completado" ? "line-through" : "none",
+              color: r.status === "completado" ? "var(--muted)" : "var(--text)" }}>{r.title}</span>) },
+          { key: "due_date", label: "Vence" },
+          { key: "estado", label: "Estado", render: (r) => {
+            if (r.status === "completado") return <span className="gp-tag ok">completado</span>;
+            if (!r.due_date) return "—";
+            const d = daysLeft(r.due_date);
+            if (d < 0) return <span className="gp-tag bad">vencido</span>;
+            if (d === 0) return <span className="gp-tag bad">vence hoy</span>;
+            if (d <= 5) return <span className="gp-tag warn">en {d} día{d > 1 ? "s" : ""}</span>;
+            return <span className="gp-muted">en {d} días</span>;
+          } },
+        ]}
+        onEdit={modal.edit} onDelete={reminders.remove} empty="Sin recordatorios. Agendá tu primera acción." />
+      <p className="gp-hint"><Bell size={13} /> Si configurás WhatsApp (ver instrucciones), te llega un aviso 5 días antes de cada vencimiento.</p>
+      <Modal open={modal.open} title={modal.editing ? "Editar recordatorio" : "Nuevo recordatorio"} onClose={modal.close}>
+        <EntityForm schema={FIELD_SCHEMAS.reminders} initial={modal.editing} onSubmit={save} onCancel={modal.close} />
+      </Modal>
+    </div>
+  );
+}
+
+/* ============================================================================
+ *  MÓDULO 7 — CONFIGURACIÓN
  * ==========================================================================*/
 function ConfiguracionModule({ userId, profile, reloadProfile, settings, reloadSettings, onLogout }) {
   const categories = useTable("categories", userId);
@@ -1862,6 +1930,11 @@ function ConfiguracionModule({ userId, profile, reloadProfile, settings, reloadS
           <div className="gp-field">
             <label>Moneda principal</label>
             <input defaultValue={settings?.currency ?? "ARS"} onBlur={(e) => saveSetting({ currency: e.target.value })} />
+          </div>
+          <div className="gp-field">
+            <label>WhatsApp para recordatorios (con código de país)</label>
+            <input placeholder="+5493511234567" defaultValue={settings?.whatsapp_number ?? ""}
+              onBlur={(e) => saveSetting({ whatsapp_number: e.target.value })} />
           </div>
         </div>
         <p className="gp-hint">Los cambios se guardan al salir de cada campo.</p>
@@ -1996,6 +2069,7 @@ export default function App() {
       case "habitos": return <HabitosModule userId={userId} profile={profile} reloadProfile={reloadProfile} />;
       case "tenis": return <TenisModule userId={userId} />;
       case "diario": return <DiarioModule userId={userId} />;
+      case "recordatorios": return <RecordatoriosModule userId={userId} />;
       case "config": return (
         <ConfiguracionModule userId={userId} profile={profile} reloadProfile={reloadProfile}
           settings={settings} reloadSettings={reloadSettings} onLogout={logout} />
@@ -2044,7 +2118,7 @@ export default function App() {
 
         {/* Bottom nav (mobile) */}
         <nav className="gp-bottomnav">
-          {[{ id: "home", label: "Inicio", icon: () => <span style={{ fontSize: 18 }}>▦</span> }, ...MODULES.slice(0, 5)]
+          {[{ id: "home", label: "Inicio", icon: () => <span style={{ fontSize: 18 }}>▦</span> }, ...MODULES]
             .map((m) => {
               const Icon = m.icon;
               const active = view === m.id;
@@ -2267,9 +2341,13 @@ h1,h2,h3,h4 { font-family:'Sora','Inter',sans-serif; margin: 0; }
 .gp-pre { background:var(--surface-2); padding:12px; border-radius:10px; font-size:13px; overflow-x:auto; }
 
 /* Bottom nav (mobile) */
-.gp-bottomnav { position:fixed; bottom:0; left:0; right:0; display:flex; background:var(--surface); border-top:1px solid var(--border); z-index:20; }
-.gp-bn-item { flex:1; display:flex; flex-direction:column; align-items:center; gap:2px; padding:8px 2px; background:none; border:none; color:var(--muted); font-size:10px; cursor:pointer; font-family:inherit; }
+.gp-bottomnav { position:fixed; bottom:0; left:0; right:0; display:flex; background:var(--surface); border-top:1px solid var(--border); z-index:20; overflow-x:auto; }
+.gp-bn-item { flex:0 0 auto; min-width:62px; display:flex; flex-direction:column; align-items:center; gap:2px; padding:8px 4px; background:none; border:none; color:var(--muted); font-size:10px; cursor:pointer; font-family:inherit; }
 .gp-bn-item.active { color:var(--primary); }
+
+/* Recordatorios: check */
+.gp-check { width:22px; height:22px; border-radius:7px; border:1.5px solid var(--border); background:var(--bg); color:#fff; cursor:pointer; display:flex; align-items:center; justify-content:center; }
+.gp-check.on { background:var(--success); border-color:var(--success); }
 
 /* Responsive: desktop */
 @media (min-width:768px) {
