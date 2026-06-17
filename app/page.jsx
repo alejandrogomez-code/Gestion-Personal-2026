@@ -523,6 +523,24 @@ function StatCard({ label, value, sub, color }) {
   );
 }
 
+// Renderiza texto con **negritas** y saltos de línea (sin mostrar los asteriscos).
+function RichText({ text }) {
+  if (!text) return null;
+  return (
+    <>
+      {String(text).split("\n").map((line, i) => (
+        <p key={i} className="gp-rich-line">
+          {line.split(/(\*\*[^*]+\*\*)/g).map((part, j) =>
+            part.startsWith("**") && part.endsWith("**")
+              ? <strong key={j}>{part.slice(2, -2)}</strong>
+              : part
+          )}
+        </p>
+      ))}
+    </>
+  );
+}
+
 function Modal({ open, title, onClose, children }) {
   if (!open) return null;
   return (
@@ -1279,7 +1297,7 @@ function EconInformes({ movements, categories, currency }) {
 /* ============================================================================
  *  MÓDULO 3 — BUENOS HÁBITOS
  * ==========================================================================*/
-function HabitosModule({ userId, profile }) {
+function HabitosModule({ userId, profile, reloadProfile }) {
   const [tab, setTab] = useState("comida");
   const meals = useTable("meals", userId);
   const activities = useTable("activities", userId);
@@ -1309,7 +1327,7 @@ function HabitosModule({ userId, profile }) {
       {tab === "comida" && <Comida meals={meals} />}
       {tab === "actividad" && <ActividadFisica activities={activities} />}
       {tab === "resumen" && <ResumenDiario meals={meals} activities={activities} />}
-      {tab === "peso" && <PesoIMC measurements={measurements} profile={profile} />}
+      {tab === "peso" && <PesoIMC measurements={measurements} profile={profile} userId={userId} reloadProfile={reloadProfile} />}
       {tab === "libros" && <Libros books={books} />}
     </div>
   );
@@ -1446,15 +1464,13 @@ function ResumenDiario({ meals, activities }) {
   );
 }
 
-function PesoIMC({ measurements, profile }) {
+function PesoIMC({ measurements, profile, userId, reloadProfile }) {
   const modal = useFormModal();
   const save = async (form) => {
     if (modal.editing) await measurements.update(modal.editing.id, form);
     else await measurements.create(form);
     modal.close();
   };
-  const [aiText, setAiText] = useState("");
-  const [aiBusy, setAiBusy] = useState(false);
 
   const sorted = [...measurements.rows].sort((a, b) => (a.date > b.date ? 1 : -1));
   const last = sorted[sorted.length - 1];
@@ -1465,13 +1481,55 @@ function PesoIMC({ measurements, profile }) {
   const diffStart = last ? num(last.weight) - startW : 0;
   const diffTarget = last ? num(last.weight) - targetW : 0;
 
-  const opinion = async () => {
+  // Cálculo del plazo y del ritmo EN EL CÓDIGO (no lo hace la IA).
+  const planCtx = useMemo(() => {
+    const dl = profile?.target_deadline ? new Date(profile.target_deadline + "T00:00:00") : null;
+    const weeksLeft = dl ? Math.max(0, Math.round((dl - new Date()) / (7 * 86400000))) : null;
+    const toLose = last && targetW ? +(num(last.weight) - targetW).toFixed(1) : null;
+    const rateWeek = weeksLeft && weeksLeft > 0 && toLose != null ? +(toLose / weeksLeft).toFixed(2) : null;
+    return { current: last?.weight ?? null, target: targetW || null, toLose, weeksLeft, rateWeek, count: sorted.length, today: todayISO() };
+  }, [profile?.target_deadline, last, targetW, sorted.length]);
+
+  // Mini-chat de la opinión IA. La última respuesta se guarda en profiles.ai_plan_opinion.
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState("");
+  const [aiBusy, setAiBusy] = useState(false);
+
+  // Cargar la última opinión guardada (una sola vez por perfil).
+  useEffect(() => {
+    if (profile?.ai_plan_opinion) setMessages([{ role: "assistant", content: profile.ai_plan_opinion }]);
+  }, [profile?.user_id]); // eslint-disable-line
+
+  const saveOpinion = async (text) => {
+    if (!supabase || !userId) return;
+    await supabase.from("profiles").update({ ai_plan_opinion: text, updated_at: new Date().toISOString() }).eq("user_id", userId);
+    reloadProfile?.();
+  };
+
+  const aiFallback = () => {
+    const { toLose, weeksLeft, rateWeek } = planCtx;
+    if (toLose == null || weeksLeft == null) return "Cargá tu objetivo de peso y el plazo en Configuración para obtener una orientación.";
+    return (
+      `Para tu objetivo necesitás bajar ${toLose} kg en ${weeksLeft} semanas, un ritmo de ${rateWeek} kg/semana. ` +
+      `Un ritmo de 0,3 a 0,7 kg/semana suele ser sostenible; si el necesario es mayor, conviene revisar el plazo. ` +
+      `Registrá tu peso cada 1-2 semanas para ver la tendencia. ` +
+      `Esto es orientación general y no reemplaza asesoramiento médico ni nutricional.`
+    );
+  };
+
+  const send = async (text) => {
+    const newMsgs = [...messages, { role: "user", content: text }];
+    setMessages(newMsgs);
+    setInput("");
     setAiBusy(true);
-    const txt = await aiWeightPlanOpinion({
-      current: last?.weight, target: targetW, deadline: profile?.target_deadline, history: sorted,
-    });
-    setAiText(txt);
-    setAiBusy(false);
+    try {
+      const r = await callAI("weight_chat", { plan: planCtx, messages: newMsgs });
+      const reply = r && r.text ? r.text : aiFallback();
+      setMessages([...newMsgs, { role: "assistant", content: reply }]);
+      saveOpinion(reply);
+    } finally {
+      setAiBusy(false);
+    }
   };
 
   return (
@@ -1483,6 +1541,10 @@ function PesoIMC({ measurements, profile }) {
           sub={last ? `${diffTarget >= 0 ? "+" : ""}${diffTarget.toFixed(1)} kg` : ""} color="var(--accent)" />
         <StatCard label="vs inicio" value={last ? `${diffStart >= 0 ? "+" : ""}${diffStart.toFixed(1)} kg` : "—"} />
       </div>
+      {planCtx.weeksLeft != null && planCtx.toLose != null && (
+        <StatCard label="Ritmo necesario" value={planCtx.rateWeek != null ? `${planCtx.rateWeek} kg/sem` : "—"}
+          sub={`Faltan ${planCtx.toLose} kg en ${planCtx.weeksLeft} semanas`} color="var(--primary)" />
+      )}
       <Card>
         <h4 className="gp-chart-title">Evolución de peso</h4>
         <LineChart labels={sorted.map((m) => m.date)} series={[{ color: "var(--primary)", points: sorted.map((m, i) => ({ x: i, y: num(m.weight) })) }]} />
@@ -1491,11 +1553,38 @@ function PesoIMC({ measurements, profile }) {
         <h4 className="gp-chart-title">Evolución de cintura</h4>
         <LineChart labels={sorted.map((m) => m.date)} series={[{ color: "var(--accent)", points: sorted.map((m, i) => ({ x: i, y: num(m.waist) })) }]} />
       </Card>
+
       <Card className="gp-ai-box">
         <div className="gp-ai-head"><Sparkles size={16} /> Opinión IA del plan</div>
-        {aiText ? <p>{aiText}</p> : <p className="gp-muted">Generá una orientación sobre tu plan de peso.</p>}
-        <Button size="sm" variant="ghost" onClick={opinion} disabled={aiBusy}>{aiBusy ? "Analizando…" : "Generar opinión"}</Button>
+        {messages.length === 0 && (
+          <p className="gp-muted">Generá una orientación sobre tu plan y después preguntá lo que quieras hasta ajustarlo.</p>
+        )}
+        {messages.length > 0 && (
+          <div className="gp-ai-chat">
+            {messages.map((m, i) => (
+              <div key={i} className={`gp-ai-msg ${m.role}`}>
+                {m.role === "user" ? <span className="gp-ai-user">{m.content}</span> : <RichText text={m.content} />}
+              </div>
+            ))}
+          </div>
+        )}
+        {messages.length === 0 ? (
+          <Button size="sm" variant="ghost" disabled={aiBusy}
+            onClick={() => send("Analizá mi objetivo de peso, el plazo y si el ritmo necesario es viable y saludable.")}>
+            {aiBusy ? "Analizando…" : "Generar opinión"}
+          </Button>
+        ) : (
+          <div className="gp-ai-inputrow">
+            <input value={input} onChange={(e) => setInput(e.target.value)}
+              placeholder="Preguntá algo sobre tu plan…"
+              onKeyDown={(e) => { if (e.key === "Enter" && input.trim() && !aiBusy) send(input.trim()); }} />
+            <Button size="sm" disabled={aiBusy || !input.trim()} onClick={() => input.trim() && send(input.trim())}>
+              {aiBusy ? "…" : "Enviar"}
+            </Button>
+          </div>
+        )}
       </Card>
+
       <CompactList items={sorted.slice().reverse()}
         columns={[
           { key: "date", label: "Fecha" },
@@ -1661,7 +1750,7 @@ function DiarioModule({ userId }) {
       </Card>
       <Card className="gp-ai-box">
         <div className="gp-ai-head"><Sparkles size={16} /> Correlaciones IA</div>
-        {insight ? <p>{insight}</p> :
+        {insight ? <RichText text={insight} /> :
           <p className="gp-muted">La IA podrá relacionar tu ánimo con peso, ejercicio, alimentación y gastos.</p>}
         <Button size="sm" variant="ghost" onClick={runInsights} disabled={aiBusy}>
           {aiBusy ? "Analizando…" : "Generar análisis"}</Button>
@@ -1904,7 +1993,7 @@ export default function App() {
     switch (view) {
       case "objetivos": return <ObjetivosModule userId={userId} />;
       case "economia": return <EconomiaModule userId={userId} currency={currency} />;
-      case "habitos": return <HabitosModule userId={userId} profile={profile} />;
+      case "habitos": return <HabitosModule userId={userId} profile={profile} reloadProfile={reloadProfile} />;
       case "tenis": return <TenisModule userId={userId} />;
       case "diario": return <DiarioModule userId={userId} />;
       case "config": return (
@@ -2136,6 +2225,14 @@ h1,h2,h3,h4 { font-family:'Sora','Inter',sans-serif; margin: 0; }
 .gp-thumb { width:34px; height:34px; object-fit:cover; border-radius:8px; border:1px solid var(--border); display:block; }
 .gp-ai-box { border:1px solid var(--accent); }
 .gp-ai-head { display:flex; align-items:center; gap:7px; font-weight:700; color:var(--accent); margin-bottom:8px; }
+.gp-rich-line { font-size:13px; margin:0 0 6px; line-height:1.5; }
+.gp-rich-line:last-child { margin-bottom:0; }
+.gp-ai-chat { display:flex; flex-direction:column; gap:10px; margin-bottom:12px; max-height:320px; overflow-y:auto; }
+.gp-ai-msg.assistant { background:var(--surface-2); border-radius:10px; padding:8px 12px; }
+.gp-ai-msg.user { align-self:flex-end; }
+.gp-ai-user { display:inline-block; background:var(--primary); color:#fff; border-radius:12px; padding:7px 12px; font-size:13px; }
+.gp-ai-inputrow { display:flex; gap:8px; }
+.gp-ai-inputrow input { flex:1; padding:9px 12px; border:1px solid var(--border); border-radius:10px; background:var(--bg); color:var(--text); font-size:14px; font-family:inherit; }
 .gp-book { display:flex; align-items:center; gap:12px; }
 .gp-book-info { flex:1; }
 .gp-progress { height:7px; background:var(--surface-2); border-radius:10px; margin:6px 0 4px; overflow:hidden; }
