@@ -17,8 +17,9 @@
  *    6. Configuración
  * ==========================================================================*/
 
-import { useState, useEffect, useMemo, useCallback, createContext, useContext } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef, createContext, useContext } from "react";
 import { createClient } from "@supabase/supabase-js";
+import Chart from "chart.js/auto";
 import {
   Target, Wallet, HeartPulse, Trophy, NotebookPen, Settings as SettingsIcon,
   Plus, X, Pencil, Trash2, Check, ChevronLeft, Sun, Moon, LogOut, Sparkles,
@@ -86,6 +87,31 @@ const PALETTES = {
 const ThemeContext = createContext(null);
 const useTheme = () => useContext(ThemeContext);
 
+// Devuelve las variables CSS activas según paleta + modo oscuro.
+function resolveThemeVars(paletteKey, dark) {
+  const base = { ...PALETTES[paletteKey].vars };
+  if (dark && !PALETTES[paletteKey].dark) {
+    return { ...PALETTES.oscuro_moderno.vars, "--primary": base["--primary"], "--accent": base["--accent"] };
+  }
+  return base;
+}
+
+// Resuelve un color que puede venir como "var(--xxx)" o como hex.
+function resolveColor(c, vars) {
+  if (typeof c === "string" && c.startsWith("var(")) {
+    const name = c.slice(4, -1).trim();
+    return vars[name] || "#3b5bdb";
+  }
+  return c || "#3b5bdb";
+}
+
+// Convierte "#rrggbb" + alpha en rgba() para rellenos translúcidos.
+function withAlpha(hex, a) {
+  const h = (hex || "#3b5bdb").replace("#", "");
+  const r = parseInt(h.slice(0, 2), 16), g = parseInt(h.slice(2, 4), 16), b = parseInt(h.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+
 /* ----------------------------------------------------------------------------
  * 3) DEFINICIÓN DE MÓDULOS (para el home tipo Odoo)
  * --------------------------------------------------------------------------*/
@@ -149,7 +175,7 @@ const FIELD_SCHEMAS = {
     { key: "date", label: "Fecha", type: "date", required: true },
     { key: "meal_type", label: "Tipo", type: "select", options: ["desayuno", "colación", "almuerzo", "merienda", "cena", "otro"], required: true },
     { key: "description", label: "Descripción", type: "textarea" },
-    { key: "photo_url", label: "Foto (URL)", type: "text" },
+    { key: "photo_url", label: "Foto (archivo o cámara)", type: "image" },
     { key: "calories", label: "Calorías estimadas", type: "number" },
     { key: "notes", label: "Observación", type: "text" },
   ],
@@ -206,6 +232,13 @@ const FIELD_SCHEMAS = {
  * --------------------------------------------------------------------------*/
 const todayISO = () => new Date().toISOString().slice(0, 10);
 const monthKey = (d) => (d || "").slice(0, 7);
+const MONTHS_ES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+// "2026-06" -> "jun 26"
+const monthLabel = (key) => {
+  const [y, m] = (key || "").split("-");
+  if (!y || !m) return key || "";
+  return `${MONTHS_ES[Number(m) - 1]} ${y.slice(2)}`;
+};
 const num = (v) => (v === null || v === undefined || v === "" ? 0 : Number(v));
 const fmtMoney = (v, cur = "ARS") =>
   new Intl.NumberFormat("es-AR", { style: "currency", currency: cur, maximumFractionDigits: 0 }).format(num(v));
@@ -439,8 +472,33 @@ function Modal({ open, title, onClose, children }) {
   );
 }
 
+// Lee un archivo de imagen, lo redimensiona y devuelve un data URL JPEG liviano.
+function fileToResizedDataURL(file, maxDim = 900, quality = 0.7) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = reject;
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = reject;
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > height && width > maxDim) { height = Math.round((height * maxDim) / width); width = maxDim; }
+        else if (height >= width && height > maxDim) { width = Math.round((width * maxDim) / height); height = maxDim; }
+        const canvas = document.createElement("canvas");
+        canvas.width = width; canvas.height = height;
+        canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 // Formulario generado a partir de un schema de campos.
-function EntityForm({ schema, initial, refs = {}, onSubmit, onCancel }) {
+// aiActions: [{ label, field, run: async (form) => valor }] agrega botones de IA.
+function EntityForm({ schema, initial, refs = {}, aiActions = [], onSubmit, onCancel }) {
+  const [aiBusy, setAiBusy] = useState(false);
   const [form, setForm] = useState(() => {
     const base = {};
     schema.forEach((f) => {
@@ -487,6 +545,22 @@ function EntityForm({ schema, initial, refs = {}, onSubmit, onCancel }) {
             </div>
           ) : f.type === "color" ? (
             <input type="color" value={form[f.key] || "#3b5bdb"} onChange={(e) => set(f.key, e.target.value)} />
+          ) : f.type === "image" ? (
+            <div className="gp-image-field">
+              <input type="file" accept="image/*" capture="environment"
+                onChange={async (e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  try { set(f.key, await fileToResizedDataURL(file)); }
+                  catch { alert("No se pudo procesar la imagen."); }
+                }} />
+              {form[f.key] && (
+                <div className="gp-image-preview">
+                  <img src={form[f.key]} alt="foto" />
+                  <button type="button" className="gp-icon-btn danger" onClick={() => set(f.key, "")}><X size={15} /></button>
+                </div>
+              )}
+            </div>
           ) : (
             <input
               type={f.type === "number" ? "number" : f.type === "date" ? "date" : "text"}
@@ -495,6 +569,16 @@ function EntityForm({ schema, initial, refs = {}, onSubmit, onCancel }) {
             />
           )}
         </div>
+      ))}
+      {aiActions.map((a) => (
+        <button key={a.field} type="button" className="gp-ai-action" disabled={aiBusy}
+          onClick={async () => {
+            setAiBusy(true);
+            try { const v = await a.run(form); if (v != null) set(a.field, v); }
+            finally { setAiBusy(false); }
+          }}>
+          <Sparkles size={15} /> {aiBusy ? "Estimando…" : a.label}
+        </button>
       ))}
       <div className="gp-form-actions">
         <Button variant="ghost" onClick={onCancel}>Cancelar</Button>
@@ -527,44 +611,108 @@ function RingChart({ value, max, size = 96, label }) {
   );
 }
 
-function BarChart({ data, height = 160 }) {
-  const max = Math.max(1, ...data.map((d) => d.value));
+/* Base reutilizable: monta y actualiza una instancia de Chart.js. */
+function ChartCanvas({ config, height = 240, ariaLabel }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+  useEffect(() => {
+    if (!canvasRef.current) return;
+    chartRef.current = new Chart(canvasRef.current, config);
+    return () => chartRef.current?.destroy();
+  }, [JSON.stringify(config)]);
   return (
-    <div className="gp-bars" style={{ height }}>
-      {data.length === 0 && <span className="gp-empty">Sin datos</span>}
-      {data.map((d, i) => (
-        <div className="gp-bar-col" key={i} title={`${d.label}: ${d.value}`}>
-          <div className="gp-bar-fill"
-            style={{ height: `${(d.value / max) * 100}%`, background: d.color || "var(--primary)" }} />
-          <span className="gp-bar-label">{d.label}</span>
-        </div>
-      ))}
+    <div style={{ position: "relative", height, width: "100%" }}>
+      <canvas ref={canvasRef} role="img" aria-label={ariaLabel || "gráfico"} />
     </div>
   );
 }
 
-function LineChart({ series, height = 180, width = 320 }) {
-  // series: [{ points: [{x:idx, y:val}], color, label }]
+/* Gráfico de barras (categorías, conteos). Muestra el valor sobre cada barra. */
+function BarChart({ data, height = 200 }) {
+  const { paletteKey, dark } = useTheme();
+  const vars = resolveThemeVars(paletteKey, dark);
+  if (!data.length) return <div className="gp-empty-box">Sin datos</div>;
+  const colors = data.map((d) => resolveColor(d.color, vars));
+  // Plugin chico para dibujar el valor encima de cada barra.
+  const valueLabels = {
+    id: "valueLabels",
+    afterDatasetsDraw(chart) {
+      const { ctx } = chart;
+      const meta = chart.getDatasetMeta(0);
+      ctx.save();
+      ctx.fillStyle = vars["--text"];
+      ctx.font = "600 11px Inter, sans-serif";
+      ctx.textAlign = "center";
+      meta.data.forEach((bar, i) => {
+        const v = data[i].value;
+        if (v != null) ctx.fillText(Math.round(v).toLocaleString("es-AR"), bar.x, bar.y - 6);
+      });
+      ctx.restore();
+    },
+  };
+  const config = {
+    type: "bar",
+    data: {
+      labels: data.map((d) => d.label),
+      datasets: [{
+        data: data.map((d) => d.value),
+        backgroundColor: colors.map((c) => withAlpha(c, 0.22)),
+        borderColor: colors, borderWidth: 1.5, borderRadius: 6, maxBarThickness: 48,
+      }],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      layout: { padding: { top: 18 } },
+      plugins: { legend: { display: false }, tooltip: { enabled: true } },
+      scales: {
+        y: { beginAtZero: true, grid: { color: withAlpha(vars["--muted"], 0.15) }, ticks: { color: vars["--muted"], font: { size: 11 } } },
+        x: { grid: { display: false }, ticks: { color: vars["--muted"], font: { size: 11 }, autoSkip: false, maxRotation: 45 } },
+      },
+    },
+    plugins: [valueLabels],
+  };
+  return <ChartCanvas config={config} height={height} ariaLabel="gráfico de barras" />;
+}
+
+/* Gráfico de líneas: curva suave + puntos marcados (combinación). */
+function LineChart({ series, labels, height = 220 }) {
+  const { paletteKey, dark } = useTheme();
+  const vars = resolveThemeVars(paletteKey, dark);
   const all = series.flatMap((s) => s.points.map((p) => p.y));
-  if (all.length === 0) return <div className="gp-empty">Sin datos</div>;
-  const minY = Math.min(...all), maxY = Math.max(...all);
-  const maxX = Math.max(...series.flatMap((s) => s.points.map((p) => p.x)), 1);
-  const pad = 24;
-  const sx = (x) => pad + (x / maxX) * (width - pad * 2);
-  const sy = (y) => maxY === minY ? height / 2 : height - pad - ((y - minY) / (maxY - minY)) * (height - pad * 2);
-  return (
-    <svg width="100%" viewBox={`0 0 ${width} ${height}`} className="gp-line">
-      {series.map((s, si) => (
-        <g key={si}>
-          <polyline fill="none" stroke={s.color || "var(--primary)"} strokeWidth="2.5"
-            points={s.points.map((p) => `${sx(p.x)},${sy(p.y)}`).join(" ")} />
-          {s.points.map((p, pi) => (
-            <circle key={pi} cx={sx(p.x)} cy={sy(p.y)} r="3" fill={s.color || "var(--primary)"} />
-          ))}
-        </g>
-      ))}
-    </svg>
-  );
+  if (all.length === 0) return <div className="gp-empty-box">Sin datos</div>;
+  const len = Math.max(...series.map((s) => s.points.length), 0);
+  const xs = labels && labels.length ? labels : Array.from({ length: len }, (_, i) => i + 1);
+  const config = {
+    type: "line",
+    data: {
+      labels: xs,
+      datasets: series.map((s) => {
+        const c = resolveColor(s.color, vars);
+        return {
+          label: s.label || "",
+          data: s.points.map((p) => p.y),
+          borderColor: c,
+          backgroundColor: withAlpha(c, 0.08),
+          borderWidth: 2,
+          tension: 0.4,          // curva suave
+          fill: series.length === 1, // relleno tenue solo si hay una sola serie
+          pointRadius: 3,        // puntos marcados
+          pointHoverRadius: 5,
+          pointBackgroundColor: c,
+          pointBorderColor: c,
+        };
+      }),
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { enabled: true } },
+      scales: {
+        y: { beginAtZero: false, grid: { color: withAlpha(vars["--muted"], 0.15) }, ticks: { color: vars["--muted"], font: { size: 11 } } },
+        x: { grid: { display: false }, ticks: { color: vars["--muted"], font: { size: 11 }, maxRotation: 45 } },
+      },
+    },
+  };
+  return <ChartCanvas config={config} height={height} ariaLabel="gráfico de evolución" />;
 }
 
 /* Cabecera reutilizable de sección con botón "Agregar". */
@@ -979,6 +1127,8 @@ function Comida({ meals }) {
       </div>
       <CompactList items={meals.rows}
         columns={[
+          { key: "photo_url", label: "", render: (m) => m.photo_url
+            ? <img src={m.photo_url} alt="" className="gp-thumb" /> : <span className="gp-muted">—</span> },
           { key: "date", label: "Fecha" }, { key: "meal_type", label: "Tipo" },
           { key: "description", label: "Descripción" },
           { key: "calories", label: "kcal", render: (m) => (
@@ -990,8 +1140,10 @@ function Comida({ meals }) {
         ]}
         onEdit={modal.edit} onDelete={meals.remove} empty="Sin comidas registradas." />
       <Modal open={modal.open} title={modal.editing ? "Editar comida" : "Registrar comida"} onClose={modal.close}>
-        <EntityForm schema={FIELD_SCHEMAS.meals} initial={modal.editing} onSubmit={save} onCancel={modal.close} />
-        <p className="gp-hint"><Sparkles size={13} /> Si dejás las calorías vacías, podés estimarlas con IA desde la lista.</p>
+        <EntityForm schema={FIELD_SCHEMAS.meals} initial={modal.editing} onSubmit={save} onCancel={modal.close}
+          aiActions={[{ label: "Estimar calorías con IA", field: "calories",
+            run: (form) => aiEstimateMealCalories({ description: form.description }) }]} />
+        <p className="gp-hint"><Sparkles size={13} /> Cargá la descripción (o la foto) y tocá "Estimar calorías con IA".</p>
       </Modal>
     </div>
   );
@@ -1025,7 +1177,9 @@ function ActividadFisica({ activities }) {
         ]}
         onEdit={modal.edit} onDelete={activities.remove} empty="Sin actividades registradas." />
       <Modal open={modal.open} title={modal.editing ? "Editar actividad" : "Registrar actividad"} onClose={modal.close}>
-        <EntityForm schema={FIELD_SCHEMAS.activities} initial={modal.editing} onSubmit={save} onCancel={modal.close} />
+        <EntityForm schema={FIELD_SCHEMAS.activities} initial={modal.editing} onSubmit={save} onCancel={modal.close}
+          aiActions={[{ label: "Estimar calorías con IA", field: "calories",
+            run: (form) => aiEstimateActivityCalories(form) }]} />
       </Modal>
     </div>
   );
@@ -1049,23 +1203,23 @@ function ResumenDiario({ meals, activities }) {
   return (
     <div>
       <SectionHeader title="Registro general diario" />
-      <div className="gp-grid gp-grid-2">
-        {days.slice(0, 8).map((d) => {
-          const saldo = d.consumed - d.burned;
-          return (
-            <Card key={d.date} className="gp-daycard">
-              <div className="gp-daycard-head"><Calendar size={15} /> {d.date}</div>
-              <div className="gp-daycard-row"><span>Consumidas</span><b>{d.consumed} kcal</b></div>
-              <div className="gp-daycard-row"><span>Gastadas</span><b>{d.burned} kcal</b></div>
-              <div className="gp-daycard-saldo" style={{ color: saldo > 0 ? "var(--danger)" : "var(--success)" }}>
-                {saldo > 0 ? <TrendingUp size={16} /> : <TrendingDown size={16} />}
-                {saldo > 0 ? "Superávit" : "Déficit"} {Math.abs(saldo)} kcal
-              </div>
-            </Card>
-          );
-        })}
-        {days.length === 0 && <div className="gp-empty-box">Registrá comidas y actividad para ver el balance.</div>}
-      </div>
+      <CompactList
+        items={days}
+        columns={[
+          { key: "date", label: "Día" },
+          { key: "consumed", label: "Consumidas", render: (d) => `${Math.round(d.consumed)} kcal` },
+          { key: "burned", label: "Gastadas", render: (d) => `${Math.round(d.burned)} kcal` },
+          { key: "saldo", label: "Saldo", render: (d) => {
+            const s = d.consumed - d.burned;
+            return (
+              <span style={{ color: s > 0 ? "var(--danger)" : "var(--success)", fontWeight: 600 }}>
+                {s > 0 ? "+" : ""}{Math.round(s)} kcal · {s > 0 ? "superávit" : "déficit"}
+              </span>
+            );
+          } },
+        ]}
+        empty="Registrá comidas y actividad para ver el balance."
+      />
     </div>
   );
 }
@@ -1109,11 +1263,11 @@ function PesoIMC({ measurements, profile }) {
       </div>
       <Card>
         <h4 className="gp-chart-title">Evolución de peso</h4>
-        <LineChart series={[{ color: "var(--primary)", points: sorted.map((m, i) => ({ x: i, y: num(m.weight) })) }]} />
+        <LineChart labels={sorted.map((m) => m.date)} series={[{ color: "var(--primary)", points: sorted.map((m, i) => ({ x: i, y: num(m.weight) })) }]} />
       </Card>
       <Card>
         <h4 className="gp-chart-title">Evolución de cintura</h4>
-        <LineChart series={[{ color: "var(--accent)", points: sorted.map((m, i) => ({ x: i, y: num(m.waist) })) }]} />
+        <LineChart labels={sorted.map((m) => m.date)} series={[{ color: "var(--accent)", points: sorted.map((m, i) => ({ x: i, y: num(m.waist) })) }]} />
       </Card>
       <Card className="gp-ai-box">
         <div className="gp-ai-head"><Sparkles size={16} /> Opinión IA del plan</div>
@@ -1203,7 +1357,7 @@ function TenisModule({ userId }) {
   const byMonth = useMemo(() => {
     const map = {};
     matches.rows.forEach((m) => { const k = monthKey(m.date); map[k] = (map[k] || 0) + 1; });
-    return Object.entries(map).sort().map(([k, v], i) => ({ x: i, y: v, label: k }));
+    return Object.entries(map).sort().map(([k, v]) => ({ label: monthLabel(k), value: v }));
   }, [matches.rows]);
 
   return (
@@ -1216,7 +1370,7 @@ function TenisModule({ userId }) {
       </div>
       <Card>
         <h4 className="gp-chart-title">Partidos por mes</h4>
-        <LineChart series={[{ color: "var(--warning)", points: byMonth }]} />
+        <BarChart data={byMonth.map((d) => ({ ...d, color: "var(--warning)" }))} />
       </Card>
       <CompactList items={matches.rows}
         columns={[
@@ -1272,10 +1426,10 @@ function DiarioModule({ userId }) {
       </div>
       <Card>
         <h4 className="gp-chart-title">Evolución de ánimo, energía y estrés</h4>
-        <LineChart series={[
-          { color: "var(--success)", points: sorted.map((r, i) => ({ x: i, y: num(r.mood) })) },
-          { color: "var(--primary)", points: sorted.map((r, i) => ({ x: i, y: num(r.energy) })) },
-          { color: "var(--danger)", points: sorted.map((r, i) => ({ x: i, y: num(r.stress) })) },
+        <LineChart labels={sorted.map((r) => r.date)} series={[
+          { color: "var(--success)", label: "Ánimo", points: sorted.map((r, i) => ({ x: i, y: num(r.mood) })) },
+          { color: "var(--primary)", label: "Energía", points: sorted.map((r, i) => ({ x: i, y: num(r.energy) })) },
+          { color: "var(--danger)", label: "Estrés", points: sorted.map((r, i) => ({ x: i, y: num(r.stress) })) },
         ]} />
         <div className="gp-legend">
           <span><i style={{ background: "var(--success)" }} />Ánimo</span>
@@ -1515,14 +1669,7 @@ export default function App() {
   useEffect(() => { if (userId) { reloadProfile(); reloadSettings(); } }, [userId, reloadProfile, reloadSettings]);
 
   // Variables CSS según paleta + modo oscuro
-  const themeVars = useMemo(() => {
-    const base = { ...PALETTES[paletteKey].vars };
-    if (dark && !PALETTES[paletteKey].dark) {
-      // Si se fuerza modo oscuro sobre paleta clara, usar la base oscura.
-      return { ...PALETTES.oscuro_moderno.vars, "--primary": base["--primary"], "--accent": base["--accent"] };
-    }
-    return base;
-  }, [paletteKey, dark]);
+  const themeVars = useMemo(() => resolveThemeVars(paletteKey, dark), [paletteKey, dark]);
 
   if (!ready) return <div className="gp-loading">Cargando…</div>;
   if (!supabase) return <><GlobalStyles /><ConfigScreen /></>;
@@ -1736,6 +1883,7 @@ h1,h2,h3,h4 { font-family:'Sora','Inter',sans-serif; margin: 0; }
 .gp-bar-col { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:flex-end; height:100%; gap:6px; }
 .gp-bar-fill { width:100%; max-width:42px; border-radius:6px 6px 0 0; min-height:2px; }
 .gp-bar-label { font-size:10px; color:var(--muted); }
+.gp-bar-value { font-size:12px; font-weight:700; color:var(--text); }
 .gp-chart-title { font-size:14px; margin-bottom:10px; }
 .gp-line { display:block; }
 .gp-legend { display:flex; gap:14px; font-size:12px; color:var(--muted); margin-top:8px; }
@@ -1756,6 +1904,14 @@ h1,h2,h3,h4 { font-family:'Sora','Inter',sans-serif; margin: 0; }
 .gp-daycard-saldo { display:flex; align-items:center; gap:6px; font-weight:700; font-size:14px; margin-top:4px; }
 .gp-cal-cell { display:flex; align-items:center; gap:6px; }
 .gp-ai-mini { display:inline-flex; align-items:center; gap:3px; font-size:11px; border:1px solid var(--accent); color:var(--accent); background:none; border-radius:14px; padding:2px 7px; cursor:pointer; }
+.gp-ai-action { display:inline-flex; align-items:center; justify-content:center; gap:6px; width:100%; border:1px solid var(--accent); color:var(--accent); background:none; border-radius:10px; padding:10px; cursor:pointer; font-size:14px; font-weight:600; font-family:inherit; }
+.gp-ai-action:hover { background:color-mix(in srgb, var(--accent) 10%, transparent); }
+.gp-ai-action:disabled { opacity:.6; cursor:default; }
+.gp-image-field { display:flex; flex-direction:column; gap:8px; }
+.gp-image-field input[type=file] { font-size:13px; }
+.gp-image-preview { display:flex; align-items:flex-start; gap:8px; }
+.gp-image-preview img { max-width:160px; max-height:160px; border-radius:10px; border:1px solid var(--border); }
+.gp-thumb { width:34px; height:34px; object-fit:cover; border-radius:8px; border:1px solid var(--border); display:block; }
 .gp-ai-box { border:1px solid var(--accent); }
 .gp-ai-head { display:flex; align-items:center; gap:7px; font-weight:700; color:var(--accent); margin-bottom:8px; }
 .gp-book { display:flex; align-items:center; gap:12px; }
