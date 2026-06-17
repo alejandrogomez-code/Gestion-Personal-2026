@@ -360,26 +360,34 @@ function useTable(table, userId) {
 
   useEffect(() => { reload(); }, [reload]);
 
+  // Convierte cadenas vacías en null para que las columnas numéricas o de
+  // fecha no fallen (Postgres rechaza "" en numeric/date).
+  const clean = (payload) => {
+    const out = {};
+    for (const [k, v] of Object.entries(payload)) out[k] = v === "" ? null : v;
+    return out;
+  };
+
   const create = async (payload) => {
     const { data, error } = await supabase
       .from(table)
-      .insert([{ ...payload, user_id: userId }])
+      .insert([{ ...clean(payload), user_id: userId }])
       .select();
-    if (error) { setError(error.message); return null; }
+    if (error) { setError(error.message); alert("No se pudo guardar: " + error.message); return null; }
     await reload();
     return data?.[0];
   };
   const update = async (id, payload) => {
     const { error } = await supabase
       .from(table)
-      .update({ ...payload, updated_at: new Date().toISOString() })
+      .update({ ...clean(payload), updated_at: new Date().toISOString() })
       .eq("id", id);
-    if (error) { setError(error.message); return; }
+    if (error) { setError(error.message); alert("No se pudo guardar: " + error.message); return; }
     await reload();
   };
   const remove = async (id) => {
     const { error } = await supabase.from(table).delete().eq("id", id);
-    if (error) { setError(error.message); return; }
+    if (error) { setError(error.message); alert("No se pudo eliminar: " + error.message); return; }
     await reload();
   };
 
